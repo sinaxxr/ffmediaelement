@@ -9,7 +9,7 @@
     </When>
     <Otherwise>
       <PropertyGroup>
-        <TargetFrameworks>net8.0-windows;net48</TargetFrameworks>
+        <TargetFrameworks>net8.0-windows</TargetFrameworks>
       </PropertyGroup>
     </Otherwise>
   </Choose>
@@ -29,37 +29,37 @@
     <NeutralLanguage>en</NeutralLanguage>
 
     <!-- Assembly Version Information -->
-    <AssemblyVersion>7.0.361.1</AssemblyVersion>
-    <FileVersion>7.0.361.1</FileVersion>
+    <AssemblyVersion>8.0.361.1</AssemblyVersion>
+    <FileVersion>8.0.361.1</FileVersion>
 
     <!-- NuGet Package Properties -->
     <!-- https://docs.microsoft.com/en-us/nuget/reference/msbuild-targets#pack-target -->
-    <PackageId>FFME.Windows</PackageId>
-    <PackageVersion>7.0.361-beta.1</PackageVersion>
-    <Version>7.0.361-beta.1</Version>
-    <Authors>Mario Di Vece, and Contributors to the FFME project</Authors>
-    <Title>FFME: The Adavanced WPF MediaElement Alternative</Title>
-    <Description>FFME is an advanced WPF MediaElement alternative. While the standard MediaElement uses DirectX (DirectShow) for media playback, FFME uses FFmpeg to read and decode audio and video.</Description>
-    <Copyright>Unosquare SA de CV, Mario Di Vece, and Contributors, (C) 2015-2024</Copyright>
+    <PackageId>Sinaxxr.FFME.Windows</PackageId>
+    <PackageVersion>8.0.361-sinaxxr.1</PackageVersion>
+    <Version>8.0.361-sinaxxr.1</Version>
+    <Authors>Sinaxxr (fork of Mario Di Vece et al.)</Authors>
+    <Title>FFME: WPF MediaElement Alternative (Sinaxxr fork) — FFmpeg 8 + lifecycle fixes</Title>
+    <Description>Fork of Unosquare.FFME upgraded to FFmpeg 8 with lifecycle stability work: dedicated decode/read worker threads, DirectSoundPlayer audio output, seek-to-zero close/open workaround. Native FFmpeg binaries are not included; see repository for installation notes.</Description>
+    <Copyright>Sinaxxr 2026; original work (C) Unosquare SA de CV, Mario Di Vece, and contributors 2015-2024</Copyright>
     <PackageRequireLicenseAcceptance>true</PackageRequireLicenseAcceptance>
     <PackageLicenseFile>LICENSE</PackageLicenseFile>
-    <PackageProjectUrl>https://github.com/unosquare/ffmediaelement</PackageProjectUrl>
+    <PackageProjectUrl>https://github.com/sinaxxr/ffmediaelement</PackageProjectUrl>
     <PackageIcon>ffme.png</PackageIcon>
     <PackageTags>ffme hls wpf ffmpeg mediaelement h264 h265 hevc audio video decoding playback frame</PackageTags>
     <PackageReleaseNotes>
-      This is a release package of the Floyd Engine build referencing bindings to FFmpeg version 4.4
-      This package does not contain the required FFmpeg binaries. Please refer to the following URL for instructions on how to obtain the binaries: https://github.com/unosquare/ffmediaelement
-      Release details: https://github.com/unosquare/ffmediaelement/milestone/16?closed=1
+      Fork of Unosquare.FFME upgraded to FFmpeg 8 / FFmpeg.AutoGen 8.0.0.1.
+      Includes lifecycle stability work: dedicated decode/read worker threads, DirectSoundPlayer audio output, seek-to-zero close/open workaround.
+      This package does not contain the required FFmpeg binaries. See repository README for installation instructions: https://github.com/sinaxxr/ffmediaelement
     </PackageReleaseNotes>
-    <RepositoryUrl>https://github.com/unosquare/ffmediaelement</RepositoryUrl>
+    <RepositoryUrl>https://github.com/sinaxxr/ffmediaelement</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
 
   </PropertyGroup>
 
   <ItemGroup>
-    <None Include="$(SolutionDir)\Support\readme.txt" Pack="true" PackagePath="" />
-    <None Include="$(SolutionDir)\LICENSE" Pack="true" PackagePath="" />
-    <None Include="$(SolutionDir)\Support\ffme.png" Pack="true" PackagePath="" />
+    <None Include="..\Support\readme.txt" Pack="true" PackagePath="" />
+    <None Include="..\LICENSE" Pack="true" PackagePath="" />
+    <None Include="..\Support\ffme.png" Pack="true" PackagePath="" />
   </ItemGroup>
 
   <ItemGroup>
@@ -78,7 +78,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="FFmpeg.AutoGen" Version="7.0.0" />
+    <PackageReference Include="FFmpeg.AutoGen" Version="8.0.0.1" />
     <PackageReference Include="Microsoft.CodeAnalysis.NetAnalyzers" Version="8.0.0">
       <PrivateAssets>all</PrivateAssets>
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
