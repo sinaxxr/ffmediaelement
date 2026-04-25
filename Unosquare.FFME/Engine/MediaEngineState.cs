@@ -684,6 +684,14 @@
             FramePosition = default;
             HasMediaEnded = default;
 
+            // HasDecodingEnded lives on MediaEngine (set by FrameDecodingWorker)
+            // and is not part of the MediaEngineState backing fields. Reset it
+            // here too — otherwise on a Close→Open sequence the flag carries
+            // over from the previous stream's real EOF, and BlockRenderingWorker's
+            // DetectPlaybackEnded sees (HasDecodingEnded==true && empty blocks)
+            // and immediately fires MediaEnded on the freshly-opened stream.
+            MediaCore.HasDecodingEnded = false;
+
             // Reset decoder and buffering
             ResetBufferingStatistics();
 

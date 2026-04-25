@@ -25,8 +25,11 @@
 
         private const int SyncLockTimeout = 100;
 
+        private static long NextRendererId;
+
         private readonly AtomicBoolean IsClosing = new(false);
         private readonly object SyncLock = new();
+        private readonly long RendererId = Interlocked.Increment(ref NextRendererId);
 
         private IWavePlayer AudioDevice;
         private SoundTouch AudioProcessor;
@@ -39,6 +42,8 @@
         private int SampleBlockSize;
         private TimeSpan RealTimeLatency;
         private DateTime LastSyncrhonize;
+        private string LastSilenceReason;
+        private int SilenceStreak;
 
         #endregion
 
@@ -282,80 +287,143 @@
         /// <inheritdoc />
         public int Read(byte[] targetBuffer, int targetBufferOffset, int requestedBytes)
         {
-            // We sync-lock the reads to avoid null reference exceptions as destroy might have been called
-            var lockTaken = false;
-
-            if (IsClosing == false)
-                Monitor.TryEnter(SyncLock, SyncLockTimeout, ref lockTaken);
-
-            if (lockTaken == false || HasFiredAudioDeviceStopped)
-            {
-                Array.Clear(targetBuffer, targetBufferOffset, requestedBytes);
-                return requestedBytes;
-            }
+            string silenceReason = null;
+            int readableCount = -1;
 
             try
             {
-                var speedRatio = MediaCore.State.SpeedRatio;
+                // We sync-lock the reads to avoid null reference exceptions as destroy might have been called
+                var lockTaken = false;
 
-                // Render silence if we don't need to output samples
-                if (MediaCore.State.IsPlaying == false || speedRatio <= 0d || MediaCore.State.HasAudio == false || AudioBuffer.ReadableCount <= 0)
+                if (IsClosing == false)
+                    Monitor.TryEnter(SyncLock, SyncLockTimeout, ref lockTaken);
+
+                if (lockTaken == false || HasFiredAudioDeviceStopped)
                 {
+                    silenceReason = lockTaken == false ? "lock_timeout" : "device_stopped";
                     Array.Clear(targetBuffer, targetBufferOffset, requestedBytes);
                     return requestedBytes;
                 }
 
-                // Ensure a pre-allocated ReadBuffer
-                if (ReadBuffer == null || ReadBuffer.Length < Convert.ToInt32(requestedBytes * Constants.MaxSpeedRatio))
-                    ReadBuffer = new byte[Convert.ToInt32(requestedBytes * Constants.MaxSpeedRatio)];
-
-                // First part of DSP: Perform AV Synchronization if needed
-                if (!Synchronize(targetBuffer, targetBufferOffset, requestedBytes, speedRatio))
-                    return requestedBytes;
-
-                var startPosition = Position;
-
-                // Perform DSP
-                if (speedRatio < 1.0)
+                try
                 {
-                    if (AudioProcessor != null)
-                        ReadAndUseAudioProcessor(requestedBytes, speedRatio);
-                    else
-                        ReadAndSlowDown(requestedBytes, speedRatio);
-                }
-                else if (speedRatio > 1.0)
-                {
-                    if (AudioProcessor != null)
-                        ReadAndUseAudioProcessor(requestedBytes, speedRatio);
-                    else
-                        ReadAndSpeedUp(requestedBytes, true, speedRatio);
-                }
-                else
-                {
-                    if (requestedBytes > AudioBuffer.ReadableCount)
+                    var speedRatio = MediaCore.State.SpeedRatio;
+
+                    // Render silence if we don't need to output samples
+                    if (MediaCore.State.IsPlaying == false || speedRatio <= 0d || MediaCore.State.HasAudio == false || AudioBuffer.ReadableCount <= 0)
                     {
+                        silenceReason =
+                            MediaCore.State.IsPlaying == false ? "not_playing" :
+                            speedRatio <= 0d ? "speed_zero" :
+                            MediaCore.State.HasAudio == false ? "no_audio" :
+                            "buffer_empty";
+                        readableCount = AudioBuffer.ReadableCount;
                         Array.Clear(targetBuffer, targetBufferOffset, requestedBytes);
                         return requestedBytes;
                     }
 
-                    AudioBuffer.Read(requestedBytes, ReadBuffer, 0);
+                    // Ensure a pre-allocated ReadBuffer
+                    if (ReadBuffer == null || ReadBuffer.Length < Convert.ToInt32(requestedBytes * Constants.MaxSpeedRatio))
+                        ReadBuffer = new byte[Convert.ToInt32(requestedBytes * Constants.MaxSpeedRatio)];
+
+                    // First part of DSP: Perform AV Synchronization if needed
+                    if (!Synchronize(targetBuffer, targetBufferOffset, requestedBytes, speedRatio))
+                    {
+                        silenceReason = "sync_failed";
+                        readableCount = AudioBuffer.ReadableCount;
+                        return requestedBytes;
+                    }
+
+                    var startPosition = Position;
+
+                    // Perform DSP
+                    if (speedRatio < 1.0)
+                    {
+                        if (AudioProcessor != null)
+                            ReadAndUseAudioProcessor(requestedBytes, speedRatio);
+                        else
+                            ReadAndSlowDown(requestedBytes, speedRatio);
+                    }
+                    else if (speedRatio > 1.0)
+                    {
+                        if (AudioProcessor != null)
+                            ReadAndUseAudioProcessor(requestedBytes, speedRatio);
+                        else
+                            ReadAndSpeedUp(requestedBytes, true, speedRatio);
+                    }
+                    else
+                    {
+                        if (requestedBytes > AudioBuffer.ReadableCount)
+                        {
+                            silenceReason = "underrun";
+                            readableCount = AudioBuffer.ReadableCount;
+                            Array.Clear(targetBuffer, targetBufferOffset, requestedBytes);
+                            return requestedBytes;
+                        }
+
+                        AudioBuffer.Read(requestedBytes, ReadBuffer, 0);
+                    }
+
+                    ApplyVolumeAndBalance(targetBuffer, targetBufferOffset, requestedBytes);
+                    MediaElement.RaiseRenderingAudioEvent(
+                        targetBuffer, requestedBytes, startPosition, WaveFormat.ConvertByteSizeToDuration(requestedBytes), RealTimeLatency, ffmpeg.AV_NOPTS_VALUE);
+                }
+                catch (Exception ex)
+                {
+                    silenceReason = "exception:" + ex.GetType().Name;
+                    this.LogError(Aspects.AudioRenderer, $"{nameof(AudioRenderer)}.{nameof(Read)} has faulted.", ex);
+                    Array.Clear(targetBuffer, targetBufferOffset, requestedBytes);
+                }
+                finally
+                {
+                    Monitor.Exit(SyncLock);
                 }
 
-                ApplyVolumeAndBalance(targetBuffer, targetBufferOffset, requestedBytes);
-                MediaElement.RaiseRenderingAudioEvent(
-                    targetBuffer, requestedBytes, startPosition, WaveFormat.ConvertByteSizeToDuration(requestedBytes), RealTimeLatency, ffmpeg.AV_NOPTS_VALUE);
-            }
-            catch (Exception ex)
-            {
-                this.LogError(Aspects.AudioRenderer, $"{nameof(AudioRenderer)}.{nameof(Read)} has faulted.", ex);
-                Array.Clear(targetBuffer, targetBufferOffset, requestedBytes);
+                return requestedBytes;
             }
             finally
             {
-                Monitor.Exit(SyncLock);
+                NoteRead(silenceReason, readableCount);
+            }
+        }
+
+        /// <summary>
+        /// Tracks silence transitions for diagnostic logging. Called once
+        /// per <see cref="Read"/> call. On transition from real audio to
+        /// silence, logs the start of the silence streak; on transition
+        /// back, logs the streak length and the last reason. Only the
+        /// transition events hit the log — sustained silence does not
+        /// flood the file.
+        /// </summary>
+        /// <param name="silenceReason">Reason for silence, or <c>null</c> on a normal read.</param>
+        /// <param name="readableCount"><c>AudioBuffer.ReadableCount</c> at silence point, or -1.</param>
+        private void NoteRead(string silenceReason, int readableCount)
+        {
+            if (silenceReason == null)
+            {
+                if (SilenceStreak > 0)
+                {
+                    DirectSoundDiagnostics.Log(
+                        RendererId,
+                        "renderer.silence.end",
+                        "after=" + SilenceStreak + " lastReason=" + LastSilenceReason);
+                    SilenceStreak = 0;
+                    LastSilenceReason = null;
+                }
+
+                return;
             }
 
-            return requestedBytes;
+            SilenceStreak++;
+            if (SilenceStreak == 1 || silenceReason != LastSilenceReason)
+            {
+                DirectSoundDiagnostics.Log(
+                    RendererId,
+                    "renderer.silence",
+                    "reason=" + silenceReason + " readable=" + readableCount + " streak=" + SilenceStreak);
+            }
+
+            LastSilenceReason = silenceReason;
         }
 
         #endregion

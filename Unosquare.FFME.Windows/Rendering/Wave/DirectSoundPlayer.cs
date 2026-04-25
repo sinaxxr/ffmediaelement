@@ -5,6 +5,7 @@
     using System;
     using System.Collections.Generic;
     using System.Diagnostics;
+    using System.Globalization;
     using System.Runtime.InteropServices;
     using System.Security;
     using System.Threading;
@@ -14,7 +15,7 @@
     /// Contact author: Alexandre Mutel - alexandre_mutel at yahoo.fr
     /// Modified by: Graham "Gee" Plumb.
     /// </summary>
-    internal sealed class DirectSoundPlayer : IntervalWorkerBase, IWavePlayer, ILoggingSource
+    internal sealed class DirectSoundPlayer : WorkerBase, IWavePlayer, ILoggingSource
     {
         #region Fields
 
@@ -27,7 +28,14 @@
         private static readonly object DevicesEnumLock = new object();
         private static List<DirectSoundDeviceData> EnumeratedDevices;
 
+        // Diagnostic counters. Values are surfaced through the log lines
+        // that increment them (OnDisposing.exit and cycle.gap); no public
+        // read path needed.
+        private static long TotalReleased;
+        private static long TotalGaps;
+
         // Instance fields
+        private readonly long DiagId = DirectSoundDiagnostics.NextInstanceId();
         private readonly EventWaitHandle CancelEvent = new EventWaitHandle(false, EventResetMode.ManualReset);
 
         private readonly WaveFormat WaveFormat;
@@ -43,6 +51,10 @@
         private EventWaitHandle FrameEndEventWaitHandle;
         private EventWaitHandle PlaybackEndedEventWaitHandle;
         private WaitHandle[] PlaybackWaitHandles;
+        private long LastCycleTicks;
+        private double LastCycleWaitMs;
+        private double LastCycleFeedMs;
+        private Thread CycleThread;
 
         #endregion
 
@@ -60,6 +72,17 @@
             Renderer = renderer;
             DeviceId = deviceId == Guid.Empty ? DefaultPlaybackDeviceId : deviceId;
             WaveFormat = renderer.WaveFormat;
+            DirectSoundDiagnostics.Log(DiagId, "ctor", "DeviceId=" + DeviceId);
+        }
+
+        /// <summary>
+        /// Finalizes an instance of the <see cref="DirectSoundPlayer"/> class.
+        /// Logs the finalization so we can correlate the next finalizer-thread
+        /// dsound RCW Release against the instance that leaked it.
+        /// </summary>
+        ~DirectSoundPlayer()
+        {
+            DirectSoundDiagnostics.Log(DiagId, "~Finalizer", "DirectSoundPlayer finalized; COM RCW Release imminent on this thread");
         }
 
         #endregion
@@ -79,7 +102,7 @@
         public bool IsRunning => WorkerState == WorkerState.Running;
 
         /// <inheritdoc />
-        public int DesiredLatency { get; private set; } = 50;
+        public int DesiredLatency { get; private set; } = 100;
 
         #endregion
 
@@ -105,6 +128,8 @@
             if (DirectSoundDriver != null || IsDisposed)
                 throw new InvalidOperationException($"{nameof(DirectSoundPlayer)} was already started");
 
+            DirectSoundDiagnostics.Log(DiagId, "Start.enter", "IsDisposed=" + IsDisposed);
+
             InitializeDirectSound();
             AudioBackBuffer.SetCurrentPosition(0);
             NextSamplesWriteIndex = 0;
@@ -120,6 +145,25 @@
             AudioBackBuffer.Play(0, 0, DirectSound.DirectSoundPlayFlags.Looping);
 
             StartAsync();
+
+            // Run the cycle on a dedicated Highest-priority thread instead
+            // of via StepTimer + ThreadPool. The pool path was the stutter
+            // driver: a Task.Run dispatch lag of 500+ ms (observed in the
+            // dsound logs) starves the dsound back buffer mid-playback.
+            // A dedicated thread is immune to ThreadPool saturation and
+            // its run-loop is naturally paced by WaitAny on the dsound
+            // notification handles (~50 ms cycle). Audio-only — video and
+            // subtitle workers stay on the existing IntervalWorkerBase
+            // path.
+            CycleThread = new Thread(CycleLoop)
+            {
+                Name = nameof(DirectSoundPlayer) + ".cycle",
+                Priority = ThreadPriority.Highest,
+                IsBackground = true,
+            };
+            CycleThread.Start();
+
+            DirectSoundDiagnostics.Log(DiagId, "Start.exit", "SamplesTotalSize=" + SamplesTotalSize + " FrameSize=" + SamplesFrameSize);
         }
 
         /// <inheritdoc />
@@ -137,16 +181,84 @@
             const int CancelHandle = 3;
             const int TimeoutHandle = WaitHandle.WaitTimeout;
 
-            // Wait for signals on frameEventWaitHandle1 (Position 0), frameEventWaitHandle2 (Position 1/2)
+            // Per-cycle GC snapshot; end-of-cycle deltas tell us whether a
+            // collection fired during this specific cycle.
+            var gen0Start = GC.CollectionCount(0);
+            var gen1Start = GC.CollectionCount(1);
+            var gen2Start = GC.CollectionCount(2);
+
+            // Preemption detector: if the interval between consecutive cycle
+            // entries is noticeably longer than the expected ~50 ms, the
+            // DirectSound circular buffer can drain and cause audible stutter.
+            // On gap, attribute: how much was our own work (prev wait+feed)
+            // vs. dispatch/scheduling delay (gap minus work minus ~50ms
+            // expected wait). Also capture thread identity, ThreadPool
+            // saturation, and full GC counts to test the starvation
+            // hypothesis.
+            // Threshold: normal DirectSound cycles run ~94-110 ms (half-buffer
+            // notification cadence + small alignment jitter), so 75 ms catches
+            // every cycle and floods the log. 150 ms only fires on real
+            // anomalies — a missed half-buffer worth of timing.
+            var now = Environment.TickCount64;
+            if (LastCycleTicks != 0)
+            {
+                var gap = now - LastCycleTicks;
+                if (gap > 150)
+                {
+                    Interlocked.Increment(ref TotalGaps);
+
+                    var t = Thread.CurrentThread;
+                    ThreadPool.GetAvailableThreads(out var poolWorkers, out var poolIO);
+                    ThreadPool.GetMaxThreads(out var poolWorkersMax, out var poolIOMax);
+                    var workerUsage = poolWorkersMax - poolWorkers;
+                    var ioUsage = poolIOMax - poolIO;
+
+                    DirectSoundDiagnostics.Log(
+                        DiagId,
+                        "cycle.gap",
+                        "ms=" + gap
+                        + " schedLagMs=" + StepTimer.LastDispatchLagMs
+                        + " prevWaitMs=" + LastCycleWaitMs.ToString("F1", CultureInfo.InvariantCulture)
+                        + " prevFeedMs=" + LastCycleFeedMs.ToString("F1", CultureInfo.InvariantCulture)
+                        + " pool=" + (t.IsThreadPoolThread ? "y" : "n")
+                        + " prio=" + t.Priority
+                        + " workers=" + workerUsage + "/" + poolWorkersMax
+                        + " io=" + ioUsage + "/" + poolIOMax
+                        + " gen0=" + gen0Start
+                        + " gen1=" + gen1Start
+                        + " gen2=" + gen2Start
+                        + " gaps=" + Interlocked.Read(ref TotalGaps));
+                }
+            }
+
+            LastCycleTicks = now;
+
+            // Split the cycle into timed phases. Slow WaitAny means the
+            // dsound event signal was late (hardware or driver side); slow
+            // FeedBackBuffer means we blocked in our own Lock/Copy/Unlock
+            // path (CPU or GC pause mid-cycle).
+            var waitStart = Stopwatch.GetTimestamp();
             var handleIndex = WaitHandle.WaitAny(PlaybackWaitHandles, DesiredLatency * 3, false);
+            var waitMs = (Stopwatch.GetTimestamp() - waitStart) * 1000.0 / Stopwatch.Frequency;
 
             // Not ready yet
             if (handleIndex == TimeoutHandle)
+            {
+                LastCycleWaitMs = waitMs;
+                LastCycleFeedMs = 0;
+                DirectSoundDiagnostics.Log(
+                    DiagId,
+                    "cycle.timeout",
+                    "waitMs=" + waitMs.ToString("F1", CultureInfo.InvariantCulture)
+                    + " gen2=" + GC.CollectionCount(2));
                 return;
+            }
 
             // Handle cancel events
             if (handleIndex == CancelHandle || handleIndex == PlaybackEndHandle)
             {
+                LastCycleWaitMs = waitMs;
+                LastCycleFeedMs = 0;
                 WantedWorkerState = WorkerState.Stopped;
                 return;
             }
@@ -154,32 +266,104 @@
             NextSamplesWriteIndex = handleIndex == FrameStartHandle ? SamplesFrameSize : default;
 
             // Only carry on playing if we can read more samples
-            if (FeedBackBuffer(SamplesFrameSize) <= 0)
+            var feedStart = Stopwatch.GetTimestamp();
+            var fed = FeedBackBuffer(SamplesFrameSize);
+            var feedMs = (Stopwatch.GetTimestamp() - feedStart) * 1000.0 / Stopwatch.Frequency;
+
+            LastCycleWaitMs = waitMs;
+            LastCycleFeedMs = feedMs;
+
+            var gen0Delta = GC.CollectionCount(0) - gen0Start;
+            var gen1Delta = GC.CollectionCount(1) - gen1Start;
+            var gen2Delta = GC.CollectionCount(2) - gen2Start;
+            var gcMidCycle = gen0Delta != 0 || gen1Delta != 0 || gen2Delta != 0;
+            var slowPhase = waitMs > 120 || feedMs > 10;
+
+            if (fed > 0 && fed < SamplesFrameSize)
+            {
+                DirectSoundDiagnostics.Log(
+                    DiagId,
+                    "feed.underrun",
+                    "got=" + fed + " want=" + SamplesFrameSize
+                    + " waitMs=" + waitMs.ToString("F1", CultureInfo.InvariantCulture)
+                    + " feedMs=" + feedMs.ToString("F1", CultureInfo.InvariantCulture)
+                    + " gc0=" + gen0Delta + " gc1=" + gen1Delta + " gc2=" + gen2Delta);
+            }
+            else if (gcMidCycle || slowPhase)
+            {
+                DirectSoundDiagnostics.Log(
+                    DiagId,
+                    "cycle.detail",
+                    "waitMs=" + waitMs.ToString("F1", CultureInfo.InvariantCulture)
+                    + " feedMs=" + feedMs.ToString("F1", CultureInfo.InvariantCulture)
+                    + " gc0=" + gen0Delta + " gc1=" + gen1Delta + " gc2=" + gen2Delta);
+            }
+
+            if (fed <= 0)
                 throw new InvalidOperationException($"Method {nameof(FeedBackBuffer)} could not write samples.");
         }
 
         /// <inheritdoc />
         protected override void OnCycleException(Exception ex)
         {
+            DirectSoundDiagnostics.Log(DiagId, "cycle.exception", ex.GetType().Name + ": " + ex.Message);
             this.LogError(Aspects.AudioRenderer, $"{nameof(DirectSoundPlayer)} faulted.", ex);
         }
 
         /// <inheritdoc />
         protected override void OnDisposing()
         {
+            DirectSoundDiagnostics.Log(DiagId, "OnDisposing.enter", "WorkerState=" + WorkerState + " PlaybackState=" + PlaybackState);
+
             // Signal Completion
             PlaybackState = PlaybackState.Stopped;
             CancelEvent.Set(); // causes the WaitAny to exit
 
-            try { AudioRenderBuffer.Stop(); } catch { /* Ignore exception and continue */ }
+            TryLogged(DiagId, "Stop.Render", () => AudioRenderBuffer.Stop());
+            TryLogged(DiagId, "ClearBack", ClearBackBuffer);
+            TryLogged(DiagId, "Stop.Back", () => AudioBackBuffer.Stop());
 
-            try { ClearBackBuffer(); } catch { /* Ignore exception and continue */ }
-            try { AudioBackBuffer.Stop(); } catch { /* Ignore exception and continue */ }
+            // Release COM RCWs on the dispose thread instead of leaving them
+            // for the finalizer thread. FFME's original Dispose left these
+            // alive, so the CLR queued them for finalizer-thread Release on
+            // the next GC; under lifecycle churn the finalizer queue would
+            // burst-release many dsound RCWs in close succession and one of
+            // them would fault inside dsound's internal error path, killing
+            // the process. Order matters: children (buffers) before parent
+            // (driver). FinalReleaseComObject drops the ref count in one
+            // shot, so the RCW is removed from the finalizer queue entirely.
+            if (AudioBackBuffer != null)
+            {
+                TryLogged(DiagId, "Release.Back", () => Marshal.FinalReleaseComObject(AudioBackBuffer));
+                AudioBackBuffer = null;
+            }
+
+            if (AudioRenderBuffer != null)
+            {
+                TryLogged(DiagId, "Release.Render", () => Marshal.FinalReleaseComObject(AudioRenderBuffer));
+                AudioRenderBuffer = null;
+            }
+
+            if (DirectSoundDriver != null)
+            {
+                TryLogged(DiagId, "Release.Driver", () => Marshal.FinalReleaseComObject(DirectSoundDriver));
+                DirectSoundDriver = null;
+            }
+
+            var totalReleased = Interlocked.Increment(ref TotalReleased);
+
+            var exitMsg = "Driver=" + DescribeRcw(DirectSoundDriver)
+                + " Render=" + DescribeRcw(AudioRenderBuffer)
+                + " Back=" + DescribeRcw(AudioBackBuffer)
+                + " totalReleased=" + totalReleased;
+            DirectSoundDiagnostics.Log(DiagId, "OnDisposing.exit", exitMsg);
         }
 
         /// <inheritdoc />
         protected override void Dispose(bool alsoManaged)
         {
+            DirectSoundDiagnostics.Log(DiagId, "Dispose.enter", "alsoManaged=" + alsoManaged);
+
             base.Dispose(alsoManaged);
 
             if (alsoManaged)
@@ -189,6 +373,46 @@
                 FrameStartEventWaitHandle?.Dispose();
                 FrameEndEventWaitHandle?.Dispose();
                 CancelEvent.Dispose();
+                DirectSoundDiagnostics.Log(DiagId, "WaitHandles", "disposed");
+            }
+
+            var exitMsg = "Driver=" + DescribeRcw(DirectSoundDriver)
+                + " Render=" + DescribeRcw(AudioRenderBuffer)
+                + " Back=" + DescribeRcw(AudioBackBuffer);
+            DirectSoundDiagnostics.Log(DiagId, "Dispose.exit", exitMsg);
+        }
+
+        /// <summary>
+        /// Describes a COM RCW field's liveness for log output. Guards nulls
+        /// and swallows <see cref="Marshal.IsComObject"/> failures.
+        /// </summary>
+        /// <param name="obj">The RCW to describe.</param>
+        /// <returns>Short string: "null", "RCW(alive)", "notRCW", or "?".</returns>
+        private static string DescribeRcw(object obj)
+        {
+            if (obj == null) return "null";
+            try { return Marshal.IsComObject(obj) ? "RCW(alive)" : "notRCW"; }
+            catch { return "?"; }
+        }
+
+        /// <summary>
+        /// Runs <paramref name="action"/>, logs success or the caught exception.
+        /// Replaces the pre-instrumentation <c>catch { /* ignore */ }</c>
+        /// pattern so silent failures show up in the dsound log.
+        /// </summary>
+        /// <param name="diagId">Instance diagnostic id.</param>
+        /// <param name="site">Tag for the log entry.</param>
+        /// <param name="action">Operation to run.</param>
+        private static void TryLogged(long diagId, string site, Action action)
+        {
+            try
+            {
+                action();
+                DirectSoundDiagnostics.Log(diagId, site, "ok");
+            }
+            catch (Exception ex)
+            {
+                DirectSoundDiagnostics.Log(diagId, site, "threw " + ex.GetType().Name + ": " + ex.Message);
             }
         }
 
@@ -379,13 +603,16 @@
                 out var nbSamples2,
                 DirectSound.DirectSoundBufferLockFlag.None);
 
-            // Copy silence data to the SecondaryBuffer
+            // Copy silence data to the SecondaryBuffer. Same wraparound
+            // handling as FeedBackBuffer — when wavBuffer2 is non-null, the
+            // second segment must also be silenced, otherwise old audio in
+            // that region survives the "clear" and plays through on resume.
             if (wavBuffer1 != IntPtr.Zero)
             {
                 Marshal.Copy(silence, 0, wavBuffer1, nbSamples1);
                 if (wavBuffer2 != IntPtr.Zero)
                 {
-                    Marshal.Copy(silence, 0, wavBuffer1, nbSamples1);
+                    Marshal.Copy(silence, 0, wavBuffer2, nbSamples2);
                 }
             }
 
@@ -402,7 +629,10 @@
         {
             // Restore the buffer if lost
             if (IsBufferLost())
+            {
+                DirectSoundDiagnostics.Log(DiagId, "buffer.lost", "restoring");
                 AudioBackBuffer.Restore();
+            }
 
             // Read data from stream (Should this be inserted between the lock / unlock?)
             var bytesRead = Renderer?.Read(Samples, 0, bytesToCopy) ?? 0;
@@ -423,14 +653,17 @@
                 out var nbSamples2,
                 DirectSound.DirectSoundBufferLockFlag.None);
 
-            // Copy back to the SecondaryBuffer
+            // Copy back to the SecondaryBuffer. DirectSound's Lock returns a
+            // second segment (wavBuffer2) when the requested range wraps past
+            // the play cursor or the end of the circular buffer; the second
+            // chunk must receive the samples continuing from offset
+            // nbSamples1 of Samples, not a repeat of the first chunk.
             if (wavBuffer1 != IntPtr.Zero)
             {
                 Marshal.Copy(Samples, 0, wavBuffer1, nbSamples1);
                 if (wavBuffer2 != IntPtr.Zero)
                 {
-                    // TODO: Should this be wav buffer 2 and nbSamples2 ??
-                    Marshal.Copy(Samples, 0, wavBuffer1, nbSamples1);
+                    Marshal.Copy(Samples, nbSamples1, wavBuffer2, nbSamples2);
                 }
             }
 
@@ -438,6 +671,29 @@
             AudioBackBuffer.Unlock(wavBuffer1, nbSamples1, wavBuffer2, nbSamples2);
 
             return bytesRead;
+        }
+
+        /// <summary>
+        /// Runs <see cref="WorkerBase.ExecuteCycleLogic"/> on a dedicated
+        /// Highest-priority thread. Replaces the StepTimer/ThreadPool
+        /// dispatch path that <see cref="IntervalWorkerBase"/> would have
+        /// provided. Loop exits when <see cref="WorkerBase.TryBeginCycle"/>
+        /// returns false (worker stopped or disposed); the worker state
+        /// transitions are handled inside that method.
+        /// </summary>
+        private void CycleLoop()
+        {
+            while (TryBeginCycle())
+            {
+                ExecuteCyle();
+
+                // If the worker is paused, throttle the spin to a cheap
+                // ~15 ms cadence — matches StepTimer's resolution so the
+                // paused behavior is equivalent to the IntervalWorkerBase
+                // path.
+                if (WorkerState != WorkerState.Running)
+                    Thread.Sleep(15);
+            }
         }
 
         #endregion

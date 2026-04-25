@@ -29,6 +29,7 @@
         };
 
         private static double TickCount;
+        private static long m_LastDispatchLagMs;
 
         private readonly Action UserCallback;
         private int m_IsDisposing;
@@ -62,6 +63,15 @@
             get;
             private set;
         }
+
+        /// <summary>
+        /// Gets the most recently observed ThreadPool dispatch lag in
+        /// milliseconds — the delay between Task.Run queueing and the
+        /// callback body actually running. Read by DirectSoundPlayer's
+        /// cycle.gap log to attribute stalls to pool starvation vs.
+        /// cycle work. Diagnostic only.
+        /// </summary>
+        public static long LastDispatchLagMs => Interlocked.Read(ref m_LastDispatchLagMs);
 
         /// <summary>
         /// Gets or sets a value indicating whether this instance is running cycle to prevent reentrancy.
@@ -117,8 +127,15 @@
 
                     t.IsRunningCycle = true;
 
+                    // Capture tick at dispatch; Task body computes the
+                    // ThreadPool scheduling lag and publishes it so
+                    // DirectSoundPlayer's cycle.gap log can attribute
+                    // stalls to pool starvation vs. cycle work.
+                    var dispatchTick = Environment.TickCount64;
+
                     Task.Run(() =>
                     {
+                        Interlocked.Exchange(ref m_LastDispatchLagMs, Environment.TickCount64 - dispatchTick);
                         try
                         {
                             t.UserCallback?.Invoke();
