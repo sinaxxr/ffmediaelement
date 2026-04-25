@@ -1,94 +1,96 @@
-# FFME: *The Advanced WPF MediaElement Alternative*
+# Sinaxxr.FFME.Windows
 
-[![Join the chat at https://gitter.im/ffmediaelement/Lobby](https://badges.gitter.im/ffmediaelement/Lobby.svg)](https://gitter.im/ffmediaelement/Lobby?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge&utm_content=badge)
-[![Analytics](https://ga-beacon.appspot.com/UA-8535255-2/unosquare/ffmediaelement/)](https://github.com/igrigorik/ga-beacon)
-[![NuGet version](https://badge.fury.io/nu/FFME.Windows.svg)](https://badge.fury.io/nu/FFME.Windows)
-[![NuGet](https://img.shields.io/nuget/dt/FFME.Windows.svg)](https://www.nuget.org/packages/FFME.Windows)
-[![Build status](https://ci.appveyor.com/api/projects/status/ppqeayanucj1hadj?svg=true)](https://ci.appveyor.com/project/geoperez/ffmediaelement)
-[![Codacy Badge](https://api.codacy.com/project/badge/Grade/c439ad57c68e43f796401467bca06e9e)](https://www.codacy.com/app/UnosquareLabs/ffmediaelement?utm_source=github.com&amp;utm_medium=referral&amp;utm_content=unosquare/ffmediaelement&amp;utm_campaign=Badge_Grade)
+[![NuGet version](https://img.shields.io/nuget/v/Sinaxxr.FFME.Windows.svg)](https://www.nuget.org/packages/Sinaxxr.FFME.Windows)
+[![NuGet downloads](https://img.shields.io/nuget/dt/Sinaxxr.FFME.Windows.svg)](https://www.nuget.org/packages/Sinaxxr.FFME.Windows)
 
-:star: *Please star this project if you like it and show your appreciation via* **[PayPal.Me](https://www.paypal.me/mariodivece/50usd)**
+A fork of [unosquare/ffmediaelement](https://github.com/unosquare/ffmediaelement) — the advanced WPF MediaElement alternative powered by FFmpeg. This fork adds **FFmpeg 8 support** and a set of **lifecycle stability fixes**.
 
 ![ffmeplay](https://github.com/unosquare/ffmediaelement/raw/master/Support/ffmeplay.png)
 
-## Status Updates
-- If you would like to support this project, you can show your appreciation via [PayPal.Me](https://www.paypal.me/mariodivece/50usd)
-- Current Status: (2024-06-26) - BETA 1 Release 7.0.361.1 is now available, (see the <a href="https://github.com/unosquare/ffmediaelement/releases">Releases</a>)
-- NuGet Package available here: https://www.nuget.org/packages/FFME.Windows/
-- FFmpeg Version: <a href="https://ffmpeg.org/download.html">7.0</a> -- Make sure you download one built as a SHARED library and for your right architecture (typically x64)
-- BREAKING CHANGE: Starting realease 4.1.320 the `Source` dependency property has been downgraded to a notification property. Please use the asynchronous `Open` and `Close` methods instead.
-- I have been learning a ton while writing this project. You can find my latest video and rendering experiments <a href="https://github.com/mariodivece/ffplaysharp">here (if you are curious)</a>
+## About This Fork
 
-*Please note the current NuGet realease might require a different version of the FFmpeg binaries than the ones of the current state of the source code.*
+This fork tracks upstream FFME 7.0.361 with the following additions:
+
+- **FFmpeg 8 / FFmpeg.AutoGen 8.0.0.1** — patched container/decoder code for the FFmpeg 8 API breakages (display matrix lookup via `av_packet_side_data_get`, `pkt_size` → `opaque`, `SwsFlags` enum, etc.).
+- **Dedicated decode/read worker threads** — `PacketReadingWorker` and `FrameDecodingWorker` are pinned to dedicated threads instead of the .NET ThreadPool, eliminating audio stutter caused by ThreadPool dispatch starvation under sustained load.
+- **DirectSoundPlayer audio output** — replaces the legacy WaveOut path that exhibited reliability issues during fast open/close cycles.
+- **Seek-to-zero close/open workaround** — FFME carries a sticky "ended" flag across `Close`/`Open` cycles that prevents fresh playback; this fork issues a `Seek(TimeSpan.Zero)` between `Open` and `Play` to clear it.
+
+The package targets **net8.0-windows** only (upstream's net48 target has been dropped).
+
+If you don't need any of the above, the upstream package at [FFME.Windows](https://www.nuget.org/packages/FFME.Windows) is the better choice.
 
 ## Quick Usage Guide for WPF Apps
 
 ### Get Started
 
 1. Open Visual Studio and create a new WPF Application.
-   
-   **Target Framework must be set to .net 5.0 or above**
-   
-2. Install the NuGet Package from your Package Manager Console: 
+
+   **Target Framework must be net8.0-windows or above.**
+
+2. Install the NuGet package:
    ```bash
-   PM> Install-Package FFME.Windows
-3. Acquire the FFmpeg shared binaries (either 64 or 32 bit, depending on your app's target architecture)
-   
-   *by either*
-   
-* Building your own
-  
-    I recommend the [Media Autobuild Suite](https://github.com/jb-alvarado/media-autobuild_suite)  _please don't ask for help on it here._
+   PM> Install-Package Sinaxxr.FFME.Windows
+   ```
+   Or via the dotnet CLI:
+   ```bash
+   dotnet add package Sinaxxr.FFME.Windows
+   ```
 
-  *or*
-* Downloading a compatible build 
+3. Acquire the FFmpeg 8 shared binaries (x64).
 
-  For a x64 build 
-  * the **dlls** are located here, [7.0 x64](https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-full-shared.7z),
-   combine the contents of the `bin` folder of both downloaded folders into a separate folder e.g `c:\ffmpeg\x64`.
- 
-   *The resulting contents of the folder e.g `c:\ffmpeg\x64` should be so*
-     - avcodec-59.dll
-     - avdevice-59.dll
-     - avfilter-8.dll
-     - avformat-59.dll
-     - avutil-58.dll
-     - ffmpeg.exe
-     - ffplay.exe
-     - ffprobe.exe
-     - swresample-4.dll
-     - swscale-6.dll
-     
-4. Within your application's startup code (Main method)
-   
-   set the _Unosquare.FFME.Library.FFmpegDirectory_ variable to the path of the folder where the DLLs and EXEs are located, e.g.
+   Download a build from [BtbN/FFmpeg-Builds releases](https://github.com/BtbN/FFmpeg-Builds/releases) — the `ffmpeg-master-latest-win64-gpl-shared.zip` (or any tagged 8.x release) works. Extract the contents of the `bin` folder to a well-known location, e.g. `c:\ffmpeg\x64`.
 
-  ```Unosquare.FFME.Library.FFmpegDirectory = @"c:\ffmpeg";```
-  
-  And use the FFME MediaElement control as you would any other WPF control.
+   The folder should contain:
+   - `avcodec-62.dll`
+   - `avdevice-62.dll`
+   - `avfilter-11.dll`
+   - `avformat-62.dll`
+   - `avutil-60.dll`
+   - `swresample-6.dll`
+   - `swscale-9.dll`
+   - `ffmpeg.exe`, `ffplay.exe`, `ffprobe.exe` (optional executables bundled in the same zip)
 
-### Example 
-in your main window (e.g MainWindow.xaml)
+   Note: BtbN's FFmpeg 8 builds are configured `--disable-postproc`, so there is no `postproc-*.dll`. FFME does not require it.
+
+4. In your application's startup code (e.g. `App.xaml.cs` constructor or the `Main` method), set the FFmpeg directory before any media is opened:
+
+   ```csharp
+   Unosquare.FFME.Library.FFmpegDirectory = @"c:\ffmpeg\x64";
+   ```
+
+   Then use the FFME `MediaElement` control as you would any other WPF control.
+
+### Example
+
+In your main window (e.g. `MainWindow.xaml`):
 
 * Add the namespace:
-```xmlns:ffme="clr-namespace:Unosquare.FFME;assembly=ffme.win"```
+  ```xml
+  xmlns:ffme="clr-namespace:Unosquare.FFME;assembly=ffme.win"
+  ```
 
 * Add the FFME control:
-```<ffme:MediaElement x:Name="Media" Background="Gray" LoadedBehavior="Play" UnloadedBehavior="Manual" />```
+  ```xml
+  <ffme:MediaElement x:Name="Media" Background="Gray" LoadedBehavior="Play" UnloadedBehavior="Manual" />
+  ```
 
-* Play files or streams, by calling the asynchronous method, Open:
-```await Media.Open(new Uri(@"c:\your-file-here"));```
+* Play files or streams by calling the asynchronous `Open` method:
+  ```csharp
+  await Media.Open(new Uri(@"c:\your-file-here"));
+  ```
 
-* Close the media, by calling:
-```await Media.Close();```
-
+* Close the media:
+  ```csharp
+  await Media.Close();
+  ```
 
 #### Additional Usage Notes
-- Remember: The `Unosquare.FFME.Windows.Sample` provides usage examples for plenty of features. Use it as your main reference.
-- The generated API documentation is available [here](http://unosquare.github.io/ffmediaelement/api/Unosquare.FFME.html)
+- The `Unosquare.FFME.Windows.Sample` project in this repository provides usage examples for plenty of features. Use it as your main reference.
+- Original API documentation is hosted upstream at [unosquare.github.io/ffmediaelement](http://unosquare.github.io/ffmediaelement/api/Unosquare.FFME.html).
 
 ## Features Overview
-FFME is an advanced and close drop-in replacement for <a href="https://msdn.microsoft.com/en-us/library/system.windows.controls.mediaelement(v=vs.110).aspx">Microsoft's WPF MediaElement Control</a>. While the standard MediaElement uses DirectX (DirectShow) for media playback, FFME uses <a href="http://ffmpeg.org/">FFmpeg</a> to read and decode audio and video. This means that for those of you who want to support stuff like HLS playback, or just don't want to go through the hassle of installing codecs on client machines, using FFME *might* just be the answer. 
+FFME is an advanced and close drop-in replacement for [Microsoft's WPF MediaElement Control](https://msdn.microsoft.com/en-us/library/system.windows.controls.mediaelement(v=vs.110).aspx). While the standard MediaElement uses DirectX (DirectShow) for media playback, FFME uses [FFmpeg](http://ffmpeg.org/) to read and decode audio and video. This means that for those of you who want to support stuff like HLS playback, or just don't want to go through the hassle of installing codecs on client machines, using FFME *might* just be the answer.
 
 FFME provides multiple improvements over the standard MediaElement such as:
 - Fast media seeking and frame-by-frame seeking.
@@ -135,25 +137,15 @@ The process described above is implemented in 3 different layers:
 A high-level diagram is provided as additional reference below.
 ![arch-michelob-2.0](https://github.com/unosquare/ffmediaelement/raw/master/Support/arch-michelob-2.0.png)
 
-### Some Work In Progress
-*Your help is welcome!*
+## Building from Source
 
-- I am planning the next version of this control, `Floyd`. See the **Issues** section.
-
-## Windows: Compiling, Running and Testing
-
-*Please note that I am unable to distribute FFmpeg's binaries because I don't know if I am allowed to do so. Follow the instructions below to compile, run and test FFME.*
-
-1. Clone this repository and make sure you have <a href="https://dotnet.microsoft.com/download/dotnet-core/3.1">.Net Core 3.1 or above</a> installed.
-2. Download the FFmpeg **shared** binaries for your target architecture: <a href="https://ffmpeg.org/download.html">FFmpeg Windows Downloads</a>.
-3. Extract the contents of the <code>zip</code> file you just downloaded and go to the <code>bin</code> folder that got extracted. You should see 3 <code>exe</code> files and multiple <code>dll</code> files. Select and copy all of them.
-4. Now paste all files from the prior step onto a well-known folder. Take note of the full path. (I used `c:\ffmpeg\`)
-5. Open the solution and set the <code>Unosquare.FFME.Windows.Sample</code> project as the startup project. You can do this by right clicking on the project and selecting <code>Set as startup project</code>. Please note that you will need Visual Studio 2019 with dotnet 5.0 SDK for your target architecture installed.
-6. Under the <code>Unosquare.FFME.Windows.Sample</code> project, find the file `App.xaml.cs` and under the constructor, locate the line <code>Library.FFmpegDirectory = @"c:\ffmpeg";</code> and replace the path so that it points to the folder where you extracted your FFmpeg binaries (dll files).
-7. Click on <code>Start</code> to run the project.
-8. You should see a sample media player. Click on the <code>Open</code> icon located at the bottom right and enter a URL or path to a media file.
-9. The file or URL should play immediately, and all the properties should display to the right of the media display by clicking on the <code>Info</code> icon.
-10. You can use the resulting compiled assemblies in your project without further dependencies. Look for ```ffme.win.dll```.
+1. Clone this repository and make sure you have the [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0) or above installed.
+2. Download the FFmpeg 8 shared binaries (see the soname list under *Get Started* above).
+3. Extract them to a well-known folder (e.g. `c:\ffmpeg\x64`).
+4. Open `Unosquare.FFME.sln` in Visual Studio 2022 (or newer) and set `Unosquare.FFME.Windows.Sample` as the startup project.
+5. In `App.xaml.cs`, locate the line `Library.FFmpegDirectory = @"c:\ffmpeg";` and replace the path so it points to the folder where you extracted the FFmpeg DLLs.
+6. Click `Start` to run. You should see a sample media player. Click on the `Open` icon at the bottom right and enter a URL or path to a media file.
+7. The compiled assembly is `ffme.win.dll`.
 
 ### ffmeplay.exe Sample Application
 
@@ -187,18 +179,21 @@ The source code for this project contains a very capable media player (`FFME.Win
 ## Thanks
 *In no particular order*
 
-- To the <a href="http://ffmpeg.org/">FFmpeg team</a> for making the Swiss Army Knife of media. I encourage you to donate to them.
-- To the <a href="https://github.com/naudio/NAudio">NAudio</a> team for making the best audio library out there for .NET -- one day I will contribute some improvements I have noticed they need.
-- To Ruslan Balanukhin for his FFmpeg interop bindings generator tool: <a href="https://github.com/Ruslan-B/FFmpeg.AutoGen">FFmpeg.AutoGen</a>.
-- To Martin Bohme for his <a href="http://dranger.com/ffmpeg/">tutorial</a> on creating a video player with FFmpeg.
-- To Barry Mieny for his beautiful <a href="http://barrymieny.deviantart.com/art/isabi4-for-Windows-105473723">FFmpeg logo</a>
+- To **Mario Di Vece, Unosquare, and the original FFME contributors** for building the project this fork is based on. See the [upstream repository](https://github.com/unosquare/ffmediaelement) for the full history.
+- To [zgabi](https://github.com/zgabi/ffmediaelement) for the initial FFmpeg 8 patch this fork builds on.
+- To the [FFmpeg team](http://ffmpeg.org/) for making the Swiss Army Knife of media. I encourage you to donate to them.
+- To the [NAudio](https://github.com/naudio/NAudio) team for making the best audio library out there for .NET.
+- To Ruslan Balanukhin for his FFmpeg interop bindings generator tool: [FFmpeg.AutoGen](https://github.com/Ruslan-B/FFmpeg.AutoGen).
+- To Martin Bohme for his [tutorial](http://dranger.com/ffmpeg/) on creating a video player with FFmpeg.
+- To Barry Mieny for his beautiful [FFmpeg logo](http://barrymieny.deviantart.com/art/isabi4-for-Windows-105473723).
 
 ## Similar Projects
-- <a href="https://github.com/higankanshi/Meta.Vlc">Meta Vlc</a>
-- <a href="https://github.com/Microsoft/FFmpegInterop">Microsoft FFmpeg Interop</a>
-- <a href="https://github.com/Sascha-L/WPF-MediaKit">WPF-MediaKit</a>
-- <a href="https://libvlcnet.codeplex.com/">LibVLC.NET</a>
-- <a href="http://playerframework.codeplex.com/">Microsoft Player Framework</a>
+- [Meta Vlc](https://github.com/higankanshi/Meta.Vlc)
+- [Microsoft FFmpeg Interop](https://github.com/Microsoft/FFmpegInterop)
+- [WPF-MediaKit](https://github.com/Sascha-L/WPF-MediaKit)
+- [LibVLC.NET](https://libvlcnet.codeplex.com/)
+- [Microsoft Player Framework](http://playerframework.codeplex.com/)
 
 ## License
-- Please refer to the <a href="https://github.com/unosquare/ffmediaelement/blob/master/LICENSE">LICENSE</a> file for more information.
+- This fork retains the original [LICENSE](LICENSE). Please refer to that file for the full terms.
+- Note: distribution of FFmpeg binaries is subject to FFmpeg's own licensing (LGPL or GPL depending on build configuration). This fork's NuGet package does not include FFmpeg binaries — they must be provided separately at runtime.
