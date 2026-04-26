@@ -99,17 +99,26 @@
         /// <returns>True if the allocation was successful.</returns>
         internal unsafe bool Allocate(VideoFrame source, AVPixelFormat pixelFormat)
         {
-            // Ensure proper allocation of the buffer
-            // If there is a size mismatch between the wanted buffer length and the existing one,
-            // then let's reallocate the buffer and set the new size (dispose of the existing one if any)
-            var targetLength = ffmpeg.av_image_get_buffer_size(pixelFormat, source.Pointer->width, source.Pointer->height, 1);
+            // sws_scale's SIMD output kernel writes destination pixels in 16-pixel-wide
+            // chunks. When the visible width isn't a multiple of 16, the tail chunk
+            // overruns the row-end of an exactly-sized destination buffer by up to 15
+            // pixels and corrupts the heap (manifest as 0xc0000374, often only on a
+            // later allocation). Over-allocate the row stride to a 16-pixel boundary
+            // so the tail writes land in our own padding instead of someone else's
+            // memory. PixelWidth still reflects the visible region; the renderer
+            // copies row-by-row to skip past the right-edge padding.
+            var visibleWidth = source.Pointer->width;
+            var visibleHeight = source.Pointer->height;
+            var alignedWidth = (visibleWidth + 15) & ~15;
+
+            var targetLength = ffmpeg.av_image_get_buffer_size(pixelFormat, alignedWidth, visibleHeight, 1);
             if (!Allocate(targetLength))
                 return false;
 
             // Update related properties
-            PictureBufferStride = ffmpeg.av_image_get_linesize(pixelFormat, source.Pointer->width, 0);
-            PixelWidth = source.Pointer->width;
-            PixelHeight = source.Pointer->height;
+            PictureBufferStride = ffmpeg.av_image_get_linesize(pixelFormat, alignedWidth, 0);
+            PixelWidth = visibleWidth;
+            PixelHeight = visibleHeight;
 
             return true;
         }

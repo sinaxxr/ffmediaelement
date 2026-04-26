@@ -121,10 +121,15 @@
         {
             // Figure out what we need to do
             var needsCreation = (TargetBitmapData == null || TargetBitmap == null) && MediaElement.HasVideo;
+
+            // Stride is intentionally NOT compared: VideoBlock over-allocates its row
+            // stride to a 16-pixel boundary as a SIMD-overrun guard (see VideoBlock.Allocate),
+            // so block.PictureBufferStride won't match WPF's tightly-packed BackBufferStride
+            // whenever PixelWidth isn't already mod-16. WriteVideoFrameBuffer copies row-by-row
+            // when the strides differ.
             var needsModification = MediaElement.HasVideo && TargetBitmap != null && TargetBitmapData != null &&
                 (TargetBitmapData.PixelWidth != block.PixelWidth ||
-                TargetBitmapData.PixelHeight != block.PixelHeight ||
-                TargetBitmapData.Stride != block.PictureBufferStride);
+                TargetBitmapData.PixelHeight != block.PixelHeight);
 
             var hasValidDimensions = block.PixelWidth > 0 && block.PixelHeight > 0;
 
@@ -163,16 +168,27 @@
                 // Lock the bitmap
                 bitmap.Lock();
 
-                // Compute a safe number of bytes to copy
-                // At this point, we it is assumed the strides are equal
-                var bufferLength = Math.Min(block.BufferLength, target.BufferLength);
+                // The block's row stride is over-allocated to a 16-pixel boundary to
+                // absorb sws_scale SIMD tail writes (see VideoBlock.Allocate). When
+                // the visible width isn't already mod-16, that source stride won't
+                // match WPF's tightly-packed back buffer stride, so we copy
+                // row-by-row instead of one contiguous block.
+                var srcStride = block.PictureBufferStride;
+                var dstStride = target.Stride;
+                var src = (byte*)block.Buffer.ToPointer();
+                var dst = (byte*)target.Scan0.ToPointer();
 
-                // Copy the block data into the back buffer of the target bitmap.
-                Buffer.MemoryCopy(
-                    block.Buffer.ToPointer(),
-                    target.Scan0.ToPointer(),
-                    bufferLength,
-                    bufferLength);
+                if (srcStride == dstStride)
+                {
+                    var bufferLength = Math.Min(block.BufferLength, target.BufferLength);
+                    Buffer.MemoryCopy(src, dst, bufferLength, bufferLength);
+                }
+                else
+                {
+                    var rowBytes = (uint)(block.PixelWidth * target.BytesPerPixel);
+                    for (var y = 0; y < block.PixelHeight; y++)
+                        Buffer.MemoryCopy(src + (y * srcStride), dst + (y * dstStride), rowBytes, rowBytes);
+                }
 
                 // with the locked video block, raise the rendering video event.
                 MediaElement?.RaiseRenderingVideoEvent(block, target, clockPosition);
